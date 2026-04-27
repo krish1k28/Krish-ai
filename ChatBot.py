@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import json
 import time
@@ -10,7 +11,8 @@ from threading import Lock
 # Load environment variables from .env
 load_dotenv()
 
-APP_ROOT = Path(__file__).parent
+# Project root and files
+APP_ROOT = Path(__file__).parent.resolve()
 CHATS_FILE = APP_ROOT / "chats.json"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -18,7 +20,8 @@ CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Thread-safe file access
 file_lock = Lock()
 
-app = Flask(__name__, template_folder="templates")
+# Use project root as the templates folder so existing index.html in the repo root is used unchanged
+app = Flask(__name__, template_folder=str(APP_ROOT))
 
 
 # -------------------------
@@ -80,14 +83,16 @@ def find_chat(data, chat_id):
 # -------------------------
 @app.route("/avatar.png")
 def avatar():
-    return send_from_directory("templates", "avatar.png")
+    # Serve avatar.png from the project root (same folder as this script)
+    return send_from_directory(str(APP_ROOT), "avatar.png")
 
 
 # -------------------------
 # Frontend
 # -------------------------
-@app.route("")
+@app.route("/")
 def index():
+    # Render the existing index.html located in the project root without modifying it
     return render_template("index.html")
 
 
