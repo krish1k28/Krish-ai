@@ -273,4 +273,7 @@ def api_save_metadata(chat_id):
 if __name__ == "__main__":
     # Ensure chats file exists
     _init_chats_file()
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    # Read host/port from environment so platform can set PORT
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", 5000))
+    app.run(host=host, port=port, debug=True)
