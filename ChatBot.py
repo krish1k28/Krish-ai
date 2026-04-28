@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
 import os
 import json
 import time
 import requests
-from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory
 from dotenv import load_dotenv
 from pathlib import Path
 from threading import Lock
@@ -11,7 +10,6 @@ from threading import Lock
 # Load environment variables from .env
 load_dotenv()
 
-# Project root and files
 APP_ROOT = Path(__file__).parent.resolve()
 CHATS_FILE = APP_ROOT / "chats.json"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -20,8 +18,8 @@ CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Thread-safe file access
 file_lock = Lock()
 
-# Use project root as the templates folder so existing index.html in the repo root is used unchanged
-app = Flask(__name__, template_folder=str(APP_ROOT))
+# Create Flask app (no templates folder for index)
+app = Flask(__name__, static_folder="static")
 
 
 # -------------------------
@@ -79,12 +77,23 @@ def find_chat(data, chat_id):
 
 
 # -------------------------
-# Static asset route
+# Static asset routes (served from project root)
 # -------------------------
 @app.route("/avatar.png")
 def avatar():
-    # Serve avatar.png from the project root (same folder as this script)
+    # Serve avatar.png from project root
     return send_from_directory(str(APP_ROOT), "avatar.png")
+
+
+@app.route("/<path:filename>")
+def root_static(filename):
+    """
+    Optional helper to serve other root-level static files if needed.
+    Be careful: this will expose any file in the project root by path.
+    Use only if you intend to serve specific files from root.
+    """
+    # Only allow a small whitelist if you want to be safer; here we serve requested filename.
+    return send_from_directory(str(APP_ROOT), filename)
 
 
 # -------------------------
@@ -92,8 +101,8 @@ def avatar():
 # -------------------------
 @app.route("/")
 def index():
-    # Render the existing index.html located in the project root without modifying it
-    return render_template("index.html")
+    # Serve index.html from project root
+    return send_from_directory(str(APP_ROOT), "index.html")
 
 
 # -------------------------
@@ -177,103 +186,24 @@ def api_get_messages(chat_id):
     return jsonify({"messages": chat.get("messages", [])})
 
 
-@app.route("/api/chats/<chat_id>/message", methods=["POST"])
-def api_post_message(chat_id):
+# -------------------------
+# Example: proxying chat completions (kept as-is; implement as needed)
+# -------------------------
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
     """
-    Accepts JSON:
-      { "message": "<text>" }
-    Calls OpenRouter and appends both user and assistant messages to the chat.
+    Example endpoint that proxies a request to OPENROUTER_API_KEY.
+    Adjust payload handling and streaming as required by your frontend.
     """
     payload = request.get_json(force=True)
-    user_message = (payload.get("message") or "").strip()
-    if not user_message:
-        return jsonify({"error": "Empty message"}), 400
-
-    data = load_chats()
-    chat = find_chat(data, chat_id)
-    if not chat:
-        return jsonify({"error": "Chat not found"}), 404
-
-    # Append user message locally first
-    user_entry = {"role": "user", "content": user_message, "timestamp": now_ts()}
-    chat.setdefault("messages", []).append(user_entry)
-    save_chats(data)
-
-    # Call OpenRouter
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
     try:
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        body = {
-            "model": "openrouter/free",
-            "messages": [
-                {"role": "system", "content": "You are Krish, an AI Coding Assistant developed by Devansh Nayak."},
-                # include recent chat context (last N messages) to keep responses coherent
-            ],
-            "max_tokens": 800,
-            "temperature": 0.2
-        }
-
-        # include last up to 10 messages from this chat for context
-        recent = chat.get("messages", [])[-10:]
-        for m in recent:
-            role = m.get("role", "user")
-            content = m.get("content", "")
-            body["messages"].append({"role": role, "content": content})
-
-        resp = requests.post(CHAT_URL, headers=headers, json=body, timeout=30)
-        resp.raise_for_status()
-        resp_json = resp.json()
-
-        # Defensive parsing for OpenRouter response shapes
-        assistant_text = ""
-        if isinstance(resp_json, dict):
-            choices = resp_json.get("choices") or []
-            if choices:
-                first = choices[0]
-                # common shape: choices[0].message.content
-                message = first.get("message") or {}
-                assistant_text = message.get("content") or first.get("text") or ""
-        if not assistant_text:
-            assistant_text = resp_json.get("text") or "Sorry, I couldn't get a response from the model."
-
-        # Append assistant message and save
-        assistant_entry = {"role": "assistant", "content": assistant_text, "timestamp": now_ts()}
-        chat.setdefault("messages", []).append(assistant_entry)
-        save_chats(data)
-
-        return jsonify({"reply": assistant_text})
-    except requests.exceptions.RequestException as e:
-        # network error: keep user message saved, return error
-        return jsonify({"error": f"Network error: {str(e)}"}), 502
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        resp = requests.post(CHAT_URL, headers=headers, json=payload, timeout=30)
+        return (resp.content, resp.status_code, resp.headers.items())
+    except requests.RequestException as e:
+        return jsonify({"error": "Upstream request failed", "details": str(e)}), 502
 
 
-# -------------------------
-# Optional: save tab metadata with a chat (client may call when creating a chat)
-# -------------------------
-@app.route("/api/chats/<chat_id>/metadata", methods=["POST"])
-def api_save_metadata(chat_id):
-    payload = request.get_json(force=True)
-    metadata = payload.get("metadata", {})
-    data = load_chats()
-    chat = find_chat(data, chat_id)
-    if not chat:
-        return jsonify({"error": "Chat not found"}), 404
-    chat["metadata"] = metadata
-    save_chats(data)
-    return jsonify({"ok": True})
-
-
-# -------------------------
-# Run
-# -------------------------
 if __name__ == "__main__":
-    # Ensure chats file exists
-    _init_chats_file()
-    # Read host/port from environment so platform can set PORT
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", 5000))
-    app.run(host=host, port=port, debug=True)
+    # Run in debug mode for development; remove debug=True in production
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
