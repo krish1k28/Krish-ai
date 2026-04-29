@@ -5,9 +5,9 @@ ChatBot.py
 Flask backend that:
 - Serves index.html and root-level static assets from the project root.
 - Provides simple chat persistence (chats.json).
-- Proxies /api/chat to OpenRouter (or any configured upstream) using OPENROUTER_API_KEY.
+- Proxies /api/chat (or /api/chats/<id>/message) to OpenRouter using OPENROUTER_API_KEY.
 - Enables CORS so a static site (e.g., GitHub Pages) can call this backend.
-- Includes basic logging and defensive error handling for easier debugging when deployed.
+- Includes basic logging and defensive error handling.
 
 Place this file in the project root alongside index.html and avatar.png.
 Install dependencies:
@@ -25,7 +25,7 @@ from flask import Flask, request, jsonify, send_from_directory, abort
 from dotenv import load_dotenv
 from flask_cors import CORS
 
-# Load environment variables from .env (if present)
+# Load environment variables from .env
 load_dotenv()
 
 # Basic logging
@@ -46,8 +46,8 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 # Thread-safe file access
 file_lock = Lock()
 
-# Create Flask app. static_folder is used for /static/* if you keep assets there.
-app = Flask(__name__, static_folder="static", static_url_path="/static")
+# Create Flask app. static_folder is None because we serve root files explicitly.
+app = Flask(__name__, static_folder=None)
 
 # Enable CORS
 CORS(app, origins=[o.strip() for o in ALLOWED_ORIGINS.split(",")] if ALLOWED_ORIGINS != "*" else "*")
@@ -87,7 +87,7 @@ def load_chats():
     with file_lock:
         try:
             return json.loads(CHATS_FILE.read_text())
-        except Exception as e:
+        except Exception:
             logger.exception("Failed to read chats.json, reinitializing")
             _init_chats_file()
             return json.loads(CHATS_FILE.read_text())
@@ -128,7 +128,7 @@ def avatar():
 @app.route("/<path:filename>")
 def root_static(filename):
     """
-    Serve other root-level files (useful for robots.txt, favicon.ico, etc).
+    Serve other root-level files (useful for robots.txt, favicon.ico, styles.css, app.js).
     Be cautious: this exposes files by name from the project root.
     """
     target = APP_ROOT / filename
@@ -318,12 +318,16 @@ def server_error(e):
 # Entrypoint
 # -------------------------
 if __name__ == "__main__":
+    # Ensure chats file exists
+    _init_chats_file()
+
     # Print startup diagnostics
     logger.info("Starting ChatBot.py")
     logger.info("APP_ROOT: %s", APP_ROOT)
     logger.info("index.html exists: %s", (APP_ROOT / "index.html").exists())
     logger.info("avatar.png exists: %s", (APP_ROOT / "avatar.png").exists())
     logger.info("chats.json exists: %s", CHATS_FILE.exists())
+    logger.info("openrouter configured: %s", bool(OPENROUTER_API_KEY))
     port = int(os.getenv("PORT", 5000))
     # In production, use a WSGI server (gunicorn) instead of Flask's dev server.
     app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
