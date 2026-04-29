@@ -5,10 +5,12 @@ ChatBot.py
 Flask backend that:
 - Serves index.html and root-level static assets from the project root.
 - If local index.html/avatar.png are missing, proxies them from a remote frontend (e.g., GitHub Pages)
-  and injects a small script to set window.BACKEND_URL so the frontend will call this backend without editing HTML.
+  and injects a small script that sets window.BACKEND_URL to the backend origin so the frontend will call this backend
+  without editing the HTML file in the repo.
 - Provides simple chat persistence (chats.json).
 - Proxies /api/chat to OpenRouter using OPENROUTER_API_KEY.
 - Enables CORS so a static site (e.g., GitHub Pages) can call this backend.
+Place this file in the project root alongside index.html and avatar.png (optional).
 """
 import os
 import json
@@ -188,20 +190,20 @@ def index():
         abort(502)
 
     # Inject a small script that sets window.BACKEND_URL to this server's origin.
-    # This avoids editing the user's HTML file permanently.
     backend_origin = os.getenv("BACKEND_ORIGIN") or f"http://127.0.0.1:{os.getenv('PORT', '5000')}"
-    injection = f'<script>window.BACKEND_URL = "{backend_origin.replace(\'"\', \'\\\"\')}";</script>'
+    # Use json.dumps to safely quote/escape the string for JS
+    injection = f'<script>window.BACKEND_URL = {json.dumps(backend_origin)};</script>'
 
     # Insert injection before closing </head> if present, else before <body>, else prepend.
     lower = text.lower()
     if "</head>" in lower:
-        # find position of last occurrence of </head> in original text (case-sensitive search on original)
-        idx = text.lower().rfind("</head>")
-        new_text = text[:idx] + injection + text[idx:]
+        idx = lower.rfind("</head>")
+        # find the same index in original text by searching for the substring at that position
+        # use lower to find position, then map to original
+        pos = idx
+        new_text = text[:pos] + injection + text[pos:]
     elif "<body" in lower:
-        idx = text.lower().find("<body")
-        # insert after opening <body ...> tag end '>'
-        # find the '>' after the <body
+        idx = lower.find("<body")
         body_close = text.find(">", idx)
         if body_close != -1:
             new_text = text[:body_close+1] + injection + text[body_close+1:]
@@ -327,6 +329,7 @@ def api_chat():
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
     try:
         resp = requests.post(CHAT_URL, headers=headers, json=payload, timeout=30)
+        # Forward status code and content
         return (resp.content, resp.status_code, resp.headers.items())
     except requests.RequestException as e:
         logger.exception("Upstream request failed")
