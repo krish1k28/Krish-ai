@@ -2,15 +2,27 @@
 """
 ChatBot.py
 
-Flask backend that:
+Flask backend for the Krish AI frontend.
+
+Features:
 - Serves index.html and root-level static assets from the project root.
-- If local index.html/avatar.png are missing, proxies them from a remote frontend (e.g., GitHub Pages)
+- If local index.html/avatar.png are missing, proxies them from a remote frontend (FRONTEND_REMOTE)
   and injects a small script that sets window.BACKEND_URL to the backend origin so the frontend will call this backend
-  without editing the HTML file in the repo.
-- Provides simple chat persistence (chats.json).
-- Proxies /api/chat to OpenRouter using OPENROUTER_API_KEY.
-- Enables CORS so a static site (e.g., GitHub Pages) can call this backend.
-Place this file in the project root alongside index.html and avatar.png (optional).
+  without editing the HTML file.
+- Simple chat persistence in chats.json with a default "general" chat.
+- Two message endpoints:
+    - POST /api/chats/<chat_id>/messages  (store-only, plural)
+    - POST /api/chats/<chat_id>/message   (backwards-compatible, calls upstream model and returns {"reply": "..."})
+- Generic proxy endpoint /api/chat to forward arbitrary completion requests to the configured CHAT_URL.
+- Improved error handling for upstream responses (including 401 Unauthorized).
+- CORS support via ALLOWED_ORIGINS environment variable.
+- Diagnostics endpoint at /diagnostics.
+
+Usage:
+- Put this file in your project root (next to index.html and avatar.png if you have them).
+- Create a .env with at least OPENROUTER_API_KEY (or leave empty to test without model calls).
+- Install dependencies: pip install flask requests python-dotenv flask-cors
+- Run: python ChatBot.py
 """
 import os
 import json
@@ -36,8 +48,8 @@ APP_ROOT = Path(__file__).parent.resolve()
 CHATS_FILE = APP_ROOT / "chats.json"
 
 # Upstream chat API config
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-CHAT_URL = os.getenv("CHAT_URL", "https://openrouter.ai/api/v1/chat/completions")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+CHAT_URL = os.getenv("CHAT_URL", "https://openrouter.ai/api/v1/chat/completions").strip()
 
 # Remote frontend (used only if local index.html/avatar.png are missing)
 FRONTEND_REMOTE = os.getenv("FRONTEND_REMOTE", "https://krish1k28.github.io/Krish-ai").rstrip("/")
@@ -156,10 +168,22 @@ def avatar():
     return Response(content, content_type=ctype)
 
 
+@app.route("/favicon.ico")
+def favicon():
+    """Serve favicon if present, else proxy remote or 404."""
+    fav = APP_ROOT / "favicon.ico"
+    if fav.exists():
+        return send_from_directory(str(APP_ROOT), "favicon.ico")
+    status, content, ctype = fetch_remote_bytes("favicon.ico")
+    if status == 200:
+        return Response(content, content_type=ctype)
+    abort(404)
+
+
 @app.route("/<path:filename>")
 def root_static(filename):
     """
-    Serve other root-level files (useful for robots.txt, favicon.ico, styles.css, app.js).
+    Serve other root-level files (useful for robots.txt, styles.css, app.js).
     If missing locally, attempt to proxy from FRONTEND_REMOTE.
     """
     target = APP_ROOT / filename
@@ -191,17 +215,13 @@ def index():
 
     # Inject a small script that sets window.BACKEND_URL to this server's origin.
     backend_origin = os.getenv("BACKEND_ORIGIN") or f"http://127.0.0.1:{os.getenv('PORT', '5000')}"
-    # Use json.dumps to safely quote/escape the string for JS
     injection = f'<script>window.BACKEND_URL = {json.dumps(backend_origin)};</script>'
 
     # Insert injection before closing </head> if present, else before <body>, else prepend.
     lower = text.lower()
     if "</head>" in lower:
         idx = lower.rfind("</head>")
-        # find the same index in original text by searching for the substring at that position
-        # use lower to find position, then map to original
-        pos = idx
-        new_text = text[:pos] + injection + text[pos:]
+        new_text = text[:idx] + injection + text[idx:]
     elif "<body" in lower:
         idx = lower.find("<body")
         body_close = text.find(">", idx)
@@ -283,7 +303,7 @@ def api_delete_chat(chat_id):
 
 
 # -------------------------
-# Messages endpoints
+# Messages endpoints (plural) - stores messages only
 # -------------------------
 @app.route("/api/chats/<chat_id>/messages", methods=["GET"])
 def api_get_messages(chat_id):
@@ -295,7 +315,11 @@ def api_get_messages(chat_id):
 
 
 @app.route("/api/chats/<chat_id>/messages", methods=["POST"])
-def api_post_message(chat_id):
+def api_post_messages_store(chat_id):
+    """
+    Append a message to the chat (store only). This endpoint does not call the model.
+    Expects JSON: { "role": "user"|"assistant", "content": "..." }
+    """
     payload = request.get_json(force=True, silent=True) or {}
     role = payload.get("role", "user")
     content = payload.get("content", "")
@@ -314,22 +338,118 @@ def api_post_message(chat_id):
 
 
 # -------------------------
-# Proxy to upstream chat completion API
+# Backwards-compatible singular message endpoint that also calls the model
+# -------------------------
+@app.route("/api/chats/<chat_id>/message", methods=["POST"])
+def api_post_message(chat_id):
+    """
+    Accepts JSON:
+      { "message": "<text>" } or { "content": "<text>" }
+    Appends the user message locally, calls the upstream model, appends assistant reply, and returns {"reply": "..."}.
+    """
+    payload = request.get_json(force=True, silent=True) or {}
+    user_message = (payload.get("message") or payload.get("content") or "").strip()
+    if not user_message:
+        return jsonify({"error": "Empty message"}), 400
+
+    data = load_chats()
+    chat = find_chat(data, chat_id)
+    if not chat:
+        return jsonify({"error": "Chat not found"}), 404
+
+    # Append user message locally first
+    user_entry = {"role": "user", "content": user_message, "timestamp": now_ts()}
+    chat.setdefault("messages", []).append(user_entry)
+    save_chats(data)
+
+    # If no API key configured, return a clear error
+    if not OPENROUTER_API_KEY:
+        logger.warning("Model call attempted but OPENROUTER_API_KEY is not set")
+        return jsonify({"error": "Server not configured with OPENROUTER_API_KEY"}), 500
+
+    # Call upstream model (OpenRouter)
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        body = {
+            "model": "openrouter/free",
+            "messages": [
+                {"role": "system", "content": "You are Krish, an AI Coding Assistant developed by Devansh Nayak."},
+            ],
+            "max_tokens": 800,
+            "temperature": 0.2
+        }
+
+        # include last up to 10 messages for context
+        recent = chat.get("messages", [])[-10:]
+        for m in recent:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            body["messages"].append({"role": role, "content": content})
+
+        resp = requests.post(CHAT_URL, headers=headers, json=body, timeout=30)
+
+        # Handle common upstream HTTP errors explicitly
+        if resp.status_code == 401:
+            logger.warning("Upstream returned 401 Unauthorized. Check OPENROUTER_API_KEY.")
+            return jsonify({"error": "Upstream unauthorized. Check OPENROUTER_API_KEY."}), 502
+        if resp.status_code >= 400:
+            # return upstream body for debugging but avoid leaking secrets
+            logger.error("Upstream returned error %s: %s", resp.status_code, resp.text[:1000])
+            return jsonify({"error": f"Upstream error {resp.status_code}", "details": resp.text[:1000]}), 502
+
+        resp_json = resp.json()
+
+        # Defensive parsing for OpenRouter response shapes
+        assistant_text = ""
+        if isinstance(resp_json, dict):
+            choices = resp_json.get("choices") or []
+            if choices:
+                first = choices[0]
+                message = first.get("message") or {}
+                assistant_text = message.get("content") or first.get("text") or ""
+        if not assistant_text:
+            assistant_text = resp_json.get("text") or "Sorry, I couldn't get a response from the model."
+
+        # Append assistant message and save
+        assistant_entry = {"role": "assistant", "content": assistant_text, "timestamp": now_ts()}
+        chat.setdefault("messages", []).append(assistant_entry)
+        save_chats(data)
+
+        return jsonify({"reply": assistant_text})
+    except requests.exceptions.RequestException as e:
+        logger.exception("Network error when calling upstream model")
+        return jsonify({"error": f"Network error: {str(e)}"}), 502
+    except Exception as e:
+        logger.exception("Model call failed")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+# -------------------------
+# Proxy to upstream chat completion API (generic)
 # -------------------------
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
+    """
+    Proxy request body to the configured CHAT_URL using OPENROUTER_API_KEY.
+    This keeps the API key server-side and allows the static frontend to call this endpoint.
+    """
     payload = request.get_json(force=True, silent=True)
     if payload is None:
         return jsonify({"error": "Invalid JSON payload"}), 400
 
     if not OPENROUTER_API_KEY:
-        logger.warning("OPENROUTER_API_KEY not set")
+        logger.warning("api_chat called but OPENROUTER_API_KEY not set")
         return jsonify({"error": "Server not configured with OPENROUTER_API_KEY"}), 500
 
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
     try:
         resp = requests.post(CHAT_URL, headers=headers, json=payload, timeout=30)
-        # Forward status code and content
+        if resp.status_code == 401:
+            logger.warning("Upstream returned 401 Unauthorized for /api/chat")
+            return jsonify({"error": "Upstream unauthorized. Check OPENROUTER_API_KEY."}), 502
         return (resp.content, resp.status_code, resp.headers.items())
     except requests.RequestException as e:
         logger.exception("Upstream request failed")
@@ -346,6 +466,10 @@ def healthz():
 
 @app.route("/diagnostics", methods=["GET"])
 def diagnostics():
+    """
+    Diagnostics returns non-sensitive info about the server state.
+    Note: OPENROUTER_API_KEY is not printed for security reasons.
+    """
     return jsonify({
         "app_root": str(APP_ROOT),
         "index_exists": (APP_ROOT / "index.html").exists(),
@@ -384,6 +508,5 @@ if __name__ == "__main__":
     logger.info("openrouter configured: %s", bool(OPENROUTER_API_KEY))
     logger.info("frontend remote: %s", FRONTEND_REMOTE)
     port = int(os.getenv("PORT", 5000))
-    # BACKEND_ORIGIN used for injection if needed; default to local dev origin
     os.environ.setdefault("BACKEND_ORIGIN", f"http://127.0.0.1:{port}")
     app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
