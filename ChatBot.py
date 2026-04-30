@@ -24,6 +24,7 @@ Usage:
 - Install dependencies: pip install flask requests python-dotenv flask-cors
 - Run: python ChatBot.py
 """
+def main()
 import os
 import json
 import time
