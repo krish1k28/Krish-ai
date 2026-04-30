@@ -1,0 +1,17 @@
+{
+  "chats": [
+    {
+      "id": "chat_1777559433556",
+      "name": "general",
+      "created_at": 1777559433.556406,
+      "metadata": {},
+      "messages": [
+        {
+          "role": "assistant",
+          "content": "New chat created. Hi, I'm Krish! I can help with coding, debugging, and explanations.",
+          "timestamp": 1777559433.5564063
+        }
+      ]
+    }
+  ]
+}
